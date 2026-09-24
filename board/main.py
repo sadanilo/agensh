@@ -121,14 +121,16 @@ def _mm(path, **kw):
 FILE_RE = re.compile(r"building\s+([\w./-]+?)[:\s]")
 
 def _task_cards():
-    """Latest claim per file + files whose PATCH_SUMMARY landed."""
+    """Latest claim per file, files whose PATCH_SUMMARY landed, last activity per author."""
     c = conn()
     rows = c.execute("SELECT kind,content,detail,author,created_at FROM entries "
                      "ORDER BY id DESC LIMIT 6000").fetchall()
     c.close()
-    claims, patched = {}, {}
+    claims, patched, last_seen = {}, {}, {}
     for kind, content, detail, author, ts in rows:
         content = content or ""
+        if author and (author not in last_seen or ts > last_seen[author]):
+            last_seen[author] = ts
         if kind == "CLAIM":
             m = FILE_RE.search(content)
             f = m.group(1) if m else None
@@ -143,7 +145,7 @@ def _task_cards():
             m = re.search(r"files=([\w./-]+)", content)
             if m and m.group(1) not in patched:
                 patched[m.group(1)] = (author, ts)
-    return claims, patched
+    return claims, patched, last_seen
 
 _SPEC = {"ts": 0, "title": "", "items": []}
 def spec():
@@ -219,7 +221,7 @@ def state():
     except Exception as e:
         msgs = [{"error": str(e)[:160], "user": "system", "msg": "", "ts": 0}]
 
-    claims, patched = _task_cards()
+    claims, patched, last_seen = _task_cards()
     now = int(time.time())
     main_files = set(repo.get("files") or [])
     doing, done = [], []
@@ -239,8 +241,8 @@ def state():
             wmap[a] = {"name": a, "file": f, "desc": d, "ts": ts}
     workers = sorted(wmap.values(), key=lambda x: x["name"])
     for w in workers:
-        w["age"] = now - w["ts"]
-        w["working"] = w["age"] < 150
+        w["age"] = now - last_seen.get(w["name"], w["ts"])
+        w["working"] = w["age"] < 120
         w["landed"] = w["file"] in patched
 
     sp = spec()
