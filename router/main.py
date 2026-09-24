@@ -43,6 +43,8 @@ client = httpx.Client(timeout=60)
 def board_write(kind, content, detail=None, author="router"):
     r = client.post(f"{BOARD}/board", json={"kind": kind, "content": content,
                                             "detail": detail, "author": author})
+    if r.status_code >= 400:
+        log.warning("board_write %s failed (%s): %s", kind, r.status_code, r.text[:300])
     r.raise_for_status(); return r.json()
 
 def board_recent(limit=2000):
@@ -67,7 +69,7 @@ def gitea_create_branch(repo, branch, base="main"):
     if branch in existing:
         return None
     return gh("POST", f"/repos/{TASK_OWNER}/{repo}/branches",
-              json={"branch_name": branch, "base": base})
+              json={"new_branch_name": branch, "old_branch_name": base})
 
 def gitea_write_file(repo, path, content, branch, message="update"):
     data = base64.b64encode(content.encode()).decode()
