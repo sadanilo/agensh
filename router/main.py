@@ -94,18 +94,38 @@ def mm_headers():
         h["Host"] = MATTERMOST_HOST
     return h
 
+_MM_CID = {"id": None}
+
+def mm_channel_id():
+    """Mattermost has no 'post by channel name' endpoint: resolve the channel id once."""
+    if _MM_CID["id"]:
+        return _MM_CID["id"]
+    r = client.get(f"{MATTERMOST}/api/v4/teams/name/{MM_TEAM}", headers=mm_headers())
+    if r.status_code != 200:
+        log.warning("mm team lookup failed (%s): %s", r.status_code, r.text[:160]); return None
+    tid = r.json()["id"]
+    r = client.get(f"{MATTERMOST}/api/v4/teams/{tid}/channels/name/{MM_CHANNEL}", headers=mm_headers())
+    if r.status_code != 200:
+        log.warning("mm channel lookup failed (%s): %s", r.status_code, r.text[:160]); return None
+    _MM_CID["id"] = r.json()["id"]
+    log.info("mm channel %s:%s -> %s", MM_TEAM, MM_CHANNEL, _MM_CID["id"])
+    return _MM_CID["id"]
+
 def mm_post(channel, msg, user_id="bot"):
-    # post to a channel; channel referenced by name in Mattermost API v4
-    r = client.post(f"{MATTERMOST}/api/v4/channels/name/{MM_TEAM}:{channel}/posts",
-                    json={"message": msg}, headers=mm_headers())
+    cid = mm_channel_id()
+    if not cid: return
+    r = client.post(f"{MATTERMOST}/api/v4/posts",
+                    json={"channel_id": cid, "message": msg}, headers=mm_headers())
     if r.status_code >= 400:
         log.warning("mm post failed (%s): %s", r.status_code, r.text[:200])
 
 def dm(user, msg, user_id="bot"):
     # Agensh DMs interrupt a peer mid-turn; here surfaced as an addressed
     # channel post (a true DM needs a direct channel created via the API first)
-    r = client.post(f"{MATTERMOST}/api/v4/channels/name/{MM_TEAM}:{MM_CHANNEL}/posts",
-                    json={"message": f"@{user} {msg}"}, headers=mm_headers())
+    cid = mm_channel_id()
+    if not cid: return
+    r = client.post(f"{MATTERMOST}/api/v4/posts",
+                    json={"channel_id": cid, "message": f"@{user} {msg}"}, headers=mm_headers())
     if r.status_code >= 400:
         log.warning("dm failed (%s): %s", r.status_code, r.text[:200])
 
@@ -240,7 +260,7 @@ async def net_probe():
     import socket
     for name in ["gitea", "mattermost", "board",
                  "gitea-lfqomkl0hzquxgyneyvfce4e",
-                 "mattermost-gwl6ll407hczyipdqghjusgn",
+                 "mattermost-pzt7olqjknbpauazzscocvir",
                  "host.docker.internal"]:
         try:
             log.info("probe resolve %s -> %s", name, socket.gethostbyname(name))
