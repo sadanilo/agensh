@@ -34,6 +34,7 @@ LLM_KEY = ENV.get("LLM_API_KEY", "")
 LLM_MODEL = ENV.get("LLM_MODEL", "")
 TASK_OWNER = ENV.get("TASK_OWNER", "admin")
 TASK_REPO = ENV.get("TASK_REPO", "task")
+TASKS_DIR = ENV.get("TASKS_DIR", "tasks_to_do")
 BUDGET = float(ENV.get("BUDGET_SECONDS", "1200"))
 IDLE_SECONDS = float(ENV.get("IDLE_SECONDS", "120"))
 
@@ -145,6 +146,46 @@ def parse_decision(text):
     try: return json.loads(m.group(0))
     except Exception: return None
 
+def derive_file(desc):
+    """Deterministic filename for an item that does not name one."""
+    s = (desc or "").strip()
+    m = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(", s)
+    if m:
+        return m.group(1) + ".py"
+    m = re.match(r"([A-Za-z_][A-Za-z0-9_.-]*)", s)
+    if m:
+        name = m.group(1).strip("._-")
+        if name:
+            return re.sub(r"[^\w.-]", "_", name) + ".py"
+    return "task.py"
+
+def parse_items(text):
+    """Items are '- <file> :: <what>' or just '- <what>' (filename derived)."""
+    items = []
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if not s.startswith("- "):
+            continue
+        body = s[2:].strip()
+        if "::" in body:
+            f, d = body.split("::", 1)
+            items.append({"file": f.strip(), "desc": d.strip()})
+        else:
+            items.append({"file": "", "desc": body})
+    used = {it["file"] for it in items if it["file"]}
+    for it in items:
+        if it["file"]:
+            continue
+        f = derive_file(it["desc"])
+        base = f[:-3] if f.endswith(".py") else f
+        i = 1
+        while f in used:
+            i += 1
+            f = f"{base}_{i}.py"
+        used.add(f)
+        it["file"] = f
+    return items
+
 # ---------------------------------------------------------------- one worker
 class Worker:
     def __init__(self, i):
@@ -178,22 +219,28 @@ Respond with ONLY a JSON object. Valid actions:
 Never repeat a peer's FACT, never retry a recorded FAIL, never touch a file off the list."""
 
     def spec(self):
-        """The team task = SPEC.md in the task repo; items are '<file> :: <what>'."""
-        txt = gitea_read_file(TASK_REPO, "SPEC.md", ref="main") or ""
-        title, desc, items = "", "", []
-        for line in txt.splitlines():
-            s = line.strip()
-            if s.startswith("#") and not title:
-                title = s.lstrip("# ").strip()
-            elif s.startswith("- "):
-                m = re.match(r"^-\s*([\w./-]+\.\w+)\s*::\s*(.*)$", s)
-                if m:
-                    items.append({"file": m.group(1), "desc": m.group(2).strip()})
-                else:
-                    items.append({"file": "", "desc": s[2:80].strip()})
-            elif s and not s.startswith("#") and not items:
-                desc = (desc + " " + s).strip()
-        return {"title": title or "(sem tarefa)", "desc": desc[:400], "items": items}
+        """Read every spec in tasks_to_do/ (files starting with _ are templates)."""
+        tasks, items = [], []
+        try:
+            listing = gh("GET", f"/repos/{TASK_OWNER}/{TASK_REPO}/contents/{TASKS_DIR}",
+                         params={"ref": "main"})
+        except Exception as e:
+            log.warning("spec listing failed: %s", e)
+            listing = None
+        for f in (listing or []):
+            name = f.get("name", "")
+            if f.get("type") != "file" or name.startswith("_"):
+                continue
+            txt = gitea_read_file(TASK_REPO, f"{TASKS_DIR}/{name}", ref="main") or ""
+            title = next((l.strip().lstrip("# ").strip() for l in txt.splitlines()
+                          if l.strip().startswith("#")), name)
+            its = parse_items(txt)
+            for it in its:
+                it["task"] = name
+            items += its
+            tasks.append({"file": name, "title": title, "items": len(its)})
+        title = ", ".join(t["title"] for t in tasks) or f"(nenhuma spec em {TASKS_DIR}/)"
+        return {"title": title, "tasks": tasks, "items": items}
 
     def item_state(self):
         """Read the board once: which task items are claimed / already landed."""
@@ -276,7 +323,9 @@ Never repeat a peer's FACT, never retry a recorded FAIL, never touch a file off 
 
         msgs = [{"role": "system", "content": self.system_prompt()},
                 {"role": "user", "content":
-                    f"TAREFA: {sp['title']}\n{sp['desc']}\n\nITENS DA TAREFA:\n" + "\n".join(lines) +
+                    f"TAREFA: {sp['title']}\n"
+                    + " | ".join(f"{t['file']}: {t['title']}" for t in (sp.get("tasks") or [])) + "\n\n"
+                    + "ITENS DA TAREFA:\n" + "\n".join(lines) +
                     "\n\nContexto recente do board:\n" + self.gather() +
                     "\n\n" + hint + " Responda com o JSON da acao."}]
         out = llm(msgs)

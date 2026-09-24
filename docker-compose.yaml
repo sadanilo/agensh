@@ -12,6 +12,7 @@ services:
       - GITEA_PASS=${GITEA_PASS}
       - TASK_OWNER=${TASK_OWNER:-admin}
       - GITEA_REPO=${TASK_REPO:-task}
+      - TASKS_DIR=${TASKS_DIR:-tasks_to_do}
       - MATTERMOST_URL=${MATTERMOST_URL}
       - MATTERMOST_HOST=${MATTERMOST_HOST}
       - MATTERMOST_TOKEN=${MATTERMOST_TOKEN}
@@ -42,6 +43,7 @@ services:
       - LLM_MODEL=${LLM_MODEL}
       - TASK_OWNER=${TASK_OWNER:-admin}
       - TASK_REPO=${TASK_REPO:-task}
+      - TASKS_DIR=${TASKS_DIR:-tasks_to_do}
       - BUDGET_SECONDS=${BUDGET_SECONDS:-1200}
       - IDLE_SECONDS=${IDLE_SECONDS:-120}
     restart: unless-stopped

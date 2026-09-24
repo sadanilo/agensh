@@ -147,31 +147,81 @@ def _task_cards():
                 patched[m.group(1)] = (author, ts)
     return claims, patched, last_seen
 
-_SPEC = {"ts": 0, "title": "", "items": []}
+TASKS_DIR = os.environ.get("TASKS_DIR", "tasks_to_do")
+
+def derive_file(desc):
+    """Deterministic filename for an item that does not name one."""
+    s = (desc or "").strip()
+    m = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(", s)
+    if m:
+        return m.group(1) + ".py"
+    m = re.match(r"([A-Za-z_][A-Za-z0-9_.-]*)", s)
+    if m:
+        name = m.group(1).strip("._-")
+        if name:
+            return re.sub(r"[^\w.-]", "_", name) + ".py"
+    return "task.py"
+
+def parse_items(text):
+    """Items are '- <file> :: <what>' or just '- <what>' (filename derived)."""
+    items = []
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if not s.startswith("- "):
+            continue
+        body = s[2:].strip()
+        if "::" in body:
+            f, d = body.split("::", 1)
+            items.append({"file": f.strip(), "desc": d.strip()})
+        else:
+            items.append({"file": "", "desc": body})
+    used = {it["file"] for it in items if it["file"]}
+    for it in items:
+        if it["file"]:
+            continue
+        f = derive_file(it["desc"])
+        base = f[:-3] if f.endswith(".py") else f
+        i = 1
+        while f in used:
+            i += 1
+            f = f"{base}_{i}.py"
+        used.add(f)
+        it["file"] = f
+    return items
+
+def _repo_file(path):
+    r = _g(f"/repos/{GITEA_OWNER}/{GITEA_REPO}/contents/{path}", params={"ref": "main"})
+    if r.status_code != 200:
+        return None
+    try:
+        return base64.b64decode(r.json()["content"]).decode()
+    except Exception:
+        return None
+
+_SPEC = {"ts": 0, "title": "", "items": [], "tasks": []}
 def spec():
-    """The team task = SPEC.md in the task repo. Items are '<file> :: <what>'."""
+    """Tasks = every .md in tasks_to_do/ (files starting with _ are templates)."""
     if time.time() - _SPEC["ts"] < 30 and _SPEC["items"]:
         return _SPEC
-    title, desc, items = "", "", []
+    tasks, items = [], []
     try:
-        r = _g(f"/repos/{GITEA_OWNER}/{GITEA_REPO}/contents/SPEC.md", params={"ref": "main"})
+        r = _g(f"/repos/{GITEA_OWNER}/{GITEA_REPO}/contents/{TASKS_DIR}", params={"ref": "main"})
         if r.status_code == 200:
-            txt = base64.b64decode(r.json()["content"]).decode()
-            for line in txt.splitlines():
-                s = line.strip()
-                if s.startswith("#") and not title:
-                    title = s.lstrip("# ").strip()
-                elif s.startswith("- "):
-                    m = re.match(r"^-\s*([\w./-]+\.\w+)\s*::\s*(.*)$", s)
-                    if m:
-                        items.append({"file": m.group(1), "desc": m.group(2).strip()})
-                    else:
-                        items.append({"file": "", "desc": s[2:80].strip()})
-                elif s and not s.startswith("#") and not items:
-                    desc = (desc + " " + s).strip()
+            names = sorted(f["name"] for f in r.json()
+                           if f.get("type") == "file" and not f["name"].startswith("_"))
+            for name in names:
+                txt = _repo_file(f"{TASKS_DIR}/{name}") or ""
+                title = next((l.strip().lstrip("# ").strip() for l in txt.splitlines()
+                              if l.strip().startswith("#")), name)
+                its = parse_items(txt)
+                for it in its:
+                    it["task"] = name
+                items += its
+                tasks.append({"file": name, "title": title, "items": len(its)})
     except Exception:
         pass
-    _SPEC.update(ts=time.time(), title=title or "(sem tarefa definida)", items=items, desc=desc[:400])
+    title = ", ".join(t["title"] for t in tasks) or f"(nenhuma spec em {TASKS_DIR}/)"
+    _SPEC.update(ts=time.time(), title=title, items=items, tasks=tasks)
     return _SPEC
 
 def _gitea_put(path, content, message, branch="main"):
@@ -214,9 +264,11 @@ def set_task(t: TaskIn):
         raise HTTPException(400, "informe ao menos um item, no formato 'arquivo.py :: o que implementar'")
     md = (f"# Task: {t.title}\n\n{t.description}\n\n## Itens\n"
           + "\n".join(f"- {f} :: {d}" for f, d in norm) + "\n")
-    r = _gitea_put("SPEC.md", md, f"task: {t.title}")
+    slug = re.sub(r"[^a-z0-9]+", "-", t.title.lower()).strip("-")[:40] or "tarefa"
+    path = f"{TASKS_DIR}/{slug}.md"
+    r = _gitea_put(path, md, f"task: {t.title}")
     if r.status_code not in (200, 201):
-        raise HTTPException(502, f"gitea SPEC.md write failed {r.status_code}: {r.text[:200]}")
+        raise HTTPException(502, f"gitea {path} write failed {r.status_code}: {r.text[:200]}")
     if t.reset:
         c = conn(); c.execute("DELETE FROM entries"); c.commit(); c.close()
     try:
@@ -318,8 +370,8 @@ def state():
         w["working"] = w["age"] < 120
         w["landed"] = w["file"] in patched
 
-    return {"spec": {"title": sp["title"], "desc": sp.get("desc", ""), "items": items,
-                     "files": sorted(spec_files)},
+    return {"spec": {"title": sp["title"], "items": items,
+                     "files": sorted(spec_files), "tasks": sp.get("tasks", [])},
             "kanban": {"backlog": backlog[:16], "doing": doing[:14],
                        "done": done[:16], "merged": merged[:16]},
             "extra": extra[:10],
@@ -504,7 +556,10 @@ async function tick(){
     prev[w.name]=w.file;
   }
   document.getElementById('spec').textContent='tarefa: '+(s.spec&&s.spec.title||'—');
-  document.getElementById('specdesc').textContent=(s.spec&&s.spec.desc)||'';
+  const st=(s.spec&&s.spec.tasks)||[];
+  document.getElementById('specdesc').innerHTML = st.length
+    ? 'specs em tasks_to_do/: ' + st.map(t=>`<b>${esc(t.file)}</b> (${t.items} itens)`).join(' &middot; ')
+    : 'nenhuma spec em tasks_to_do/ &mdash; coloque um .md l&aacute; no Gitea, ou use o formul&aacute;rio abaixo';
   document.getElementById('clock').textContent=new Date().toLocaleTimeString();
   document.getElementById('stats').textContent='board entries: '+(s.ts?'live':'—');
   renderKanban(s.kanban||{}); renderRooms(s.workers); renderChat(s.messages); renderBar(s.repo||{}, s.extra);
