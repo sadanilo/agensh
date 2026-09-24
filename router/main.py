@@ -62,12 +62,12 @@ def gh(method, path, **kw):
     return r.json() if r.text else None
 
 def gitea_create_branch(repo, branch, base="main"):
-    # PIP-like: create a new branch pointing at base
-    b = gh("GET", f"/repos/{TASK_OWNER}/{repo}/branches/{base}")
-    sha = b["commit"]["id"]
+    # create the worker branch from base if it does not exist yet
+    existing = [x["name"] for x in gh("GET", f"/repos/{TASK_OWNER}/{repo}/branches")]
+    if branch in existing:
+        return None
     return gh("POST", f"/repos/{TASK_OWNER}/{repo}/branches",
-              json={"branch_name": branch, "base": base}) if branch not in [
-        x["name"] for x in gh("GET", f"/repos/{TASK_OWNER}/{repo}/branches")] else None
+              json={"branch_name": branch, "base": base})
 
 def gitea_write_file(repo, path, content, branch, message="update"):
     data = base64.b64encode(content.encode()).decode()
@@ -161,8 +161,14 @@ Never repeat a peer's FACT, never retry a recorded FAIL."""
     def select_slices(self):
         # task-specific slices (synthetic task). The task repo has a spec file.
         spec = gitea_read_file(TASK_REPO, "SPEC.md") or "implement mywc.py"
-        known = [x["name"] for x in gh("GET", f"/repos/{TASK_OWNER}/{TASK_REPO}/contents", params={"ref": self.branch})]
-        return known
+        for ref in (self.branch, "main"):
+            try:
+                listing = gh("GET", f"/repos/{TASK_OWNER}/{TASK_REPO}/contents",
+                             params={"ref": ref})
+                return [x["name"] for x in (listing or [])]
+            except Exception:
+                continue
+        return []
 
     async def run(self, stop_event):
         log.info("%s online", self.handle)

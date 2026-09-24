@@ -4,6 +4,17 @@ services:
     expose: ["8000"]
     environment:
       - BOARD_DB=/data/board.db
+      - GITEA_URL=${GITEA_URL}
+      - GITEA_HOST=${GITEA_HOST}
+      - GITEA_USER=${GITEA_USER}
+      - GITEA_PASS=${GITEA_PASS}
+      - TASK_OWNER=${TASK_OWNER:-admin}
+      - GITEA_REPO=${TASK_REPO:-task}
+      - MATTERMOST_URL=${MATTERMOST_URL}
+      - MATTERMOST_HOST=${MATTERMOST_HOST}
+      - MATTERMOST_TOKEN=${MATTERMOST_TOKEN}
+      - MATTERMOST_TEAM=${MATTERMOST_TEAM:-agentsh}
+      - MATTERMOST_CHANNEL=${MATTERMOST_CHANNEL:-pbench-task}
     volumes:
       - board-data:/data
     restart: unless-stopped
