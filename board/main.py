@@ -57,12 +57,15 @@ def write(e: EntryIn):
         raise HTTPException(400, f"kind must be one of {sorted(KINDS)}")
     if len(e.content) > 100 and e.kind != "PATCH_SUMMARY":
         e.content = e.content[:100]
-    c = conn(); now = int(time.time())
-    c.execute("INSERT INTO entries(kind,content,detail,author,created_at) VALUES(?,?,?,?,?)",
-              (e.kind, e.content, e.detail, e.author, now))
-    c.commit(); last = c.lastrowid
-    row = c.execute("SELECT id,kind,content,detail,author,created_at FROM entries WHERE id=?", (last,)).fetchone()
-    c.close()
+    try:
+        c = conn(); now = int(time.time())
+        c.execute("INSERT INTO entries(kind,content,detail,author,created_at) VALUES(?,?,?,?,?)",
+                  (e.kind, e.content, e.detail, e.author, now))
+        c.commit(); last = c.lastrowid
+        row = c.execute("SELECT id,kind,content,detail,author,created_at FROM entries WHERE id=?", (last,)).fetchone()
+        c.close()
+    except Exception as ex:
+        raise HTTPException(500, f"board write error: {type(ex).__name__}: {ex}")
     return EntryOut(id=row[0], kind=row[1], content=row[2], detail=row[3], author=row[4], created_at=row[5])
 
 @app.get("/board/recent")
