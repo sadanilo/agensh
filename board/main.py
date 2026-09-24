@@ -59,9 +59,9 @@ def write(e: EntryIn):
         e.content = e.content[:100]
     try:
         c = conn(); now = int(time.time())
-        c.execute("INSERT INTO entries(kind,content,detail,author,created_at) VALUES(?,?,?,?,?)",
-                  (e.kind, e.content, e.detail, e.author, now))
-        c.commit(); last = c.lastrowid
+        cur = c.execute("INSERT INTO entries(kind,content,detail,author,created_at) VALUES(?,?,?,?,?)",
+                        (e.kind, e.content, e.detail, e.author, now))
+        c.commit(); last = cur.lastrowid
         row = c.execute("SELECT id,kind,content,detail,author,created_at FROM entries WHERE id=?", (last,)).fetchone()
         c.close()
     except Exception as ex:
