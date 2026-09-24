@@ -11,7 +11,7 @@
 import sqlite3, os, time, json, re, base64
 import httpx
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response, RedirectResponse
 from pydantic import BaseModel, Field
 
 DB = os.environ.get("BOARD_DB", "data/board.db")
@@ -118,7 +118,7 @@ def _mm(path, **kw):
     if MM_HOST: h["Host"] = MM_HOST
     return HX.get(f"{MM}/api/v4{path}", headers=h, **kw)
 
-FILE_RE = re.compile(r"building\s+([\w./-]+?)[:\s]")
+FILE_RE = re.compile(r"building\s+([\w./-]+\.\w+)")
 
 def _task_cards():
     """Latest claim per file, files whose PATCH_SUMMARY landed, last activity per author."""
@@ -529,7 +529,8 @@ function renderBar(r, extra){
      <span class="chip pr">PRs abertos: <b>${pr.length}</b> ${pr.map(p=>esc(p.head)).join(' ')||''}</span>
      <span class=chip>commits: ${(r.commits||[]).length}</span>
      <span class=chip>arquivos@main: ${(r.files||[]).length}</span>
-     ${ex.length?`<span class="chip warn">fora do SPEC: <b>${ex.length}</b> ${ex.map(e=>esc(e.file)).join(' ')||''}</span>`:''}`;
+     ${ex.length?`<span class="chip warn">fora do SPEC: <b>${ex.length}</b> ${ex.map(e=>esc(e.file)).join(' ')||''}</span>`:''}
+     <a class="chip pr" href="/game/" target="_blank">jogar o jogo &rarr;</a>`;
 }
 function fly(from, to, file){
   const src=document.querySelector('.card[data-file="'+cssEsc(file)+'"]');
@@ -592,3 +593,27 @@ tick(); setInterval(tick,2000);
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard(): return DASH
+
+# ------------------------------------------------- serve the built artifact
+CTYPES = {"html": "text/html; charset=utf-8", "css": "text/css; charset=utf-8",
+          "js": "application/javascript; charset=utf-8", "json": "application/json",
+          "svg": "image/svg+xml", "md": "text/plain; charset=utf-8"}
+
+def _serve(name):
+    """Serve a file from the task repo's main branch, so the artifact is playable
+    without a second deployment (the build container cannot reach this Gitea)."""
+    if "/" in name or name.startswith("."):
+        raise HTTPException(400, "bad name")
+    txt = _repo_file(name)
+    if txt is None:
+        raise HTTPException(404, f"{name} nao existe no main (ainda nao foi merged)")
+    return Response(txt, media_type=CTYPES.get(name.rsplit(".", 1)[-1], "text/plain; charset=utf-8"))
+
+@app.get("/game")
+def game_root(): return RedirectResponse("/game/")
+
+@app.get("/game/")
+def game_index(): return _serve("index.html")
+
+@app.get("/game/{name}")
+def game_file(name: str): return _serve(name)
