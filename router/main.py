@@ -186,6 +186,25 @@ def parse_items(text):
         it["file"] = f
     return items
 
+def verify_artifact(f, code):
+    """Python gets a real syntax check; browser artifacts get a structural one."""
+    if not code or len(code.strip()) < 40:
+        return False
+    if f.endswith(".py"):
+        try:
+            compile(code, f, "exec")
+            return True
+        except SyntaxError:
+            return False
+    if f.endswith(".html"):
+        low = code.lower()
+        return ("<html" in low or "<!doctype" in low) and "<canvas" in low
+    if f.endswith(".css"):
+        return "{" in code and "}" in code
+    if f.endswith(".js"):
+        return ("function" in code or "=>" in code) and "{" in code
+    return True
+
 # ---------------------------------------------------------------- one worker
 class Worker:
     def __init__(self, i):
@@ -357,11 +376,10 @@ Never repeat a peer's FACT, never retry a recorded FAIL, never touch a file off 
                 board_write("FAIL", f"{self.handle} recusou escrever {f}: fora do SPEC",
                             author=self.handle)
                 return
-            # light verify: valid python
-            try:
-                compile(code, f, "exec")
-            except SyntaxError as e:
-                board_write("FAIL", f"{self.handle} {f} failed syntax", str(e), author=self.handle)
+            # light verify: real syntax check for python, structural for browser files
+            if not verify_artifact(f, code):
+                board_write("FAIL", f"{self.handle} {f} failed verify",
+                            "artefato invalido ou vazio", author=self.handle)
                 return
             # conflict check: if another worker recently CLAIMed this exact file
             if any(e["kind"]=="CLAIM" and decision["file"] in e["content"] and e["author"]!=self.handle
