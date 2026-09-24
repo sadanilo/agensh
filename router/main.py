@@ -243,6 +243,24 @@ async def net_probe():
                 s.close(); log.info("probe tcp %s:%d OPEN", host, port)
             except Exception as e:
                 log.warning("probe tcp %s:%d closed (%s)", host, port, e)
+    try:
+        r = client.get(f"{GITEA}/api/v1/version")
+        log.info("probe http gitea(%s) -> %s", GITEA, r.status_code)
+    except Exception as e:
+        log.warning("probe http gitea(%s) failed: %s", GITEA, e)
+    for name in ["mattermost", "mattermost-gwl6ll407hczyipdqghjusgn",
+                 "gwl6ll407hczyipdqghjusgn", "mattermost-mattermost",
+                 "agentsh-mattermost", "mattermost-team"]:
+        try:
+            ip = socket.gethostbyname(name)
+            log.info("probe mm resolve %s -> %s", name, ip)
+            try:
+                r = client.get(f"http://{name}:8065/api/v4/system/ping")
+                log.info("probe mm http %s -> %s", name, r.status_code)
+            except Exception as e:
+                log.warning("probe mm http %s failed: %s", name, e)
+        except Exception as e:
+            log.warning("probe mm resolve %s failed: %s", name, e)
 
 
 async def main():
