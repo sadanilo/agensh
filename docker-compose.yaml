@@ -2,6 +2,8 @@ services:
   board:
     build: ./board
     expose: ["8000"]
+    ports:
+      - "8099:8000"
     environment:
       - BOARD_DB=/data/board.db
       - GITEA_URL=${GITEA_URL}
