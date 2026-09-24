@@ -1,12 +1,14 @@
-"""Agensh shared-context board + live dashboard.
+"""Agensh shared-context board + live office dashboard.
 
 - Append-only, typed memory shared across workers (OBSERVED, FACT, FAIL,
   CLAIM, PATCH_SUMMARY), over a plain HTTP API.
-- A server-side /state aggregator (board + Gitea repo + Mattermost channel)
-  and a self-refreshing HTML dashboard at /, so the organisation can be
-  watched live: who claims what, what lands, and the repo state.
+- /state aggregates server-side: task kanban (derived from the board's
+  claim/patch history), one cubicle per worker, Gitea repo state and the
+  Mattermost channel. Secrets never reach the browser.
+- / renders the live office: kanban (left) | worker cubicles (right)
+  and the Mattermost chat below.
 """
-import sqlite3, os, time, json
+import sqlite3, os, time, json, re, base64
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
@@ -116,6 +118,70 @@ def _mm(path, **kw):
     if MM_HOST: h["Host"] = MM_HOST
     return HX.get(f"{MM}/api/v4{path}", headers=h, **kw)
 
+FILE_RE = re.compile(r"building\s+([\w./-]+?)[:\s]")
+
+def _task_cards():
+    """Latest claim per file + files whose PATCH_SUMMARY landed."""
+    c = conn()
+    rows = c.execute("SELECT kind,content,detail,author,created_at FROM entries "
+                     "ORDER BY id DESC LIMIT 6000").fetchall()
+    c.close()
+    claims, patched = {}, {}
+    for kind, content, detail, author, ts in rows:
+        content = content or ""
+        if kind == "CLAIM":
+            m = FILE_RE.search(content)
+            f = m.group(1) if m else None
+            if not f:
+                m2 = re.match(r"([\w./-]+\.\w+)", (detail or "").strip())
+                f = m2.group(1) if m2 else None
+            if not f: continue
+            prev = claims.get(f)
+            if prev is None or ts > prev[1]:
+                claims[f] = (author, ts, ((detail or content).strip())[:150])
+        elif kind == "PATCH_SUMMARY":
+            m = re.search(r"files=([\w./-]+)", content)
+            if m and m.group(1) not in patched:
+                patched[m.group(1)] = (author, ts)
+    return claims, patched
+
+_SPEC = {"ts": 0, "title": "", "items": []}
+def spec():
+    if time.time() - _SPEC["ts"] < 60 and _SPEC["items"]:
+        return _SPEC
+    title, items = "", []
+    try:
+        r = _g(f"/repos/{GITEA_OWNER}/{GITEA_REPO}/contents/SPEC.md", params={"ref": "main"})
+        if r.status_code == 200:
+            txt = base64.b64decode(r.json()["content"]).decode()
+            for line in txt.splitlines():
+                s = line.strip()
+                if s.startswith("#") and not title:
+                    title = s.lstrip("# ").strip()
+                elif s.startswith("- "):
+                    m = re.search(r"([\w_]+)\s*\(", s)
+                    items.append(m.group(1) + "()" if m else s[2:38].strip())
+    except Exception:
+        pass
+    _SPEC.update(ts=time.time(), title=title or "task", items=items)
+    return _SPEC
+
+_USERS = {"ts": 0, "map": {}}
+def usernames(ids):
+    ids = sorted(set(i for i in ids if i))
+    if not ids: return {}
+    if time.time() - _USERS["ts"] > 300 or not set(ids) <= set(_USERS["map"]):
+        try:
+            h = {"Authorization": f"Bearer {MM_TOKEN}", "Content-Type": "application/json"}
+            if MM_HOST: h["Host"] = MM_HOST
+            r = HX.post(f"{MM}/api/v4/users/ids", json=ids, headers=h)
+            if r.status_code == 200:
+                _USERS["map"] = {u["id"]: u["username"] for u in r.json()}
+                _USERS["ts"] = time.time()
+        except Exception:
+            pass
+    return _USERS["map"]
+
 @app.get("/state")
 def state():
     repo = {"branches": [], "files": [], "pulls": [], "commits": []}
@@ -134,55 +200,224 @@ def state():
         repo["pulls"] = [{"title": p["title"], "state": p["state"], "head": p["head"]["label"]}
                          for p in _g(f"/repos/{GITEA_OWNER}/{GITEA_REPO}/pulls", params={"state": "all"}).json()]
     except Exception as e: repo["pulls_error"] = str(e)[:120]
+
     msgs = []
     try:
         ch = _mm(f"/teams/name/{MM_TEAM}/channels/name/{MM_CHANNEL}")
         if ch.status_code == 200:
             cid = ch.json()["id"]
-            posts = _mm(f"/channels/{cid}/posts", params={"per_page": 30}).json()
-            for pid in (posts.get("order") or [])[:30]:
-                p = posts["posts"][pid]
-                msgs.append({"user": (p.get("user_id") or "")[:8], "msg": p.get("message", "")[:200]})
+            posts = _mm(f"/channels/{cid}/posts", params={"per_page": 40}).json()
+            order = list(reversed(posts.get("order") or []))[:40]
+            raw = [posts["posts"][pid] for pid in order]
+            names = usernames([p.get("user_id") for p in raw])
+            for p in raw:
+                msgs.append({"user": names.get(p.get("user_id"), (p.get("user_id") or "?")[:8]),
+                             "msg": p.get("message", "")[:400],
+                             "ts": p.get("create_at", 0)})
         else:
-            msgs = [{"error": f"channel lookup {ch.status_code}"}]
+            msgs = [{"error": f"channel lookup {ch.status_code}", "user": "system", "msg": "", "ts": 0}]
     except Exception as e:
-        msgs = [{"error": str(e)[:160]}]
-    return {"board": recent(200)[:200], "repo": repo, "messages": msgs, "ts": int(time.time())}
+        msgs = [{"error": str(e)[:160], "user": "system", "msg": "", "ts": 0}]
 
-DASH = """<!doctype html><html><head><meta charset=utf-8><title>Agensh live</title>
-<style>body{background:#0f1115;color:#dfe3ea;font:13px/1.45 ui-monospace,Menlo,monospace;margin:0;padding:16px}
-h1{font-size:16px;margin:0 0 10px}h2{color:#8ab4ff;margin:14px 0 6px;font-size:13px;text-transform:uppercase;letter-spacing:.08em}
-.wrap{display:grid;grid-template-columns:1.35fr 1fr;gap:16px}
-.card{background:#171a21;border:1px solid #242a36;border-radius:8px;padding:10px;max-height:62vh;overflow:auto}
-.k{display:inline-block;padding:1px 6px;border-radius:4px;font-weight:700;margin-right:6px}
-.CLAIM{background:#3b3216;color:#ffd479}.FACT{background:#12331f;color:#7ee2a8}.OBSERVED{background:#132a3b;color:#7cc4ff}
-.FAIL{background:#3b1a1a;color:#ff9a9a}.PATCH_SUMMARY{background:#241a3b;color:#c9a8ff}
-.e{padding:4px 0;border-bottom:1px solid #1d222c}.t{color:#5c6675;font-size:11px}
-ul{margin:4px 0;padding-left:18px}code{color:#9fd0ff}</style></head><body>
-<h1>AGENSH &middot; organiza&ccedil;&atilde;o viva <span class=t id=ts></span></h1>
-<div class=wrap>
- <div><h2>Shared context (board)</h2><div class=card id=board></div>
-      <h2>Mattermost #pbench-task</h2><div class=card id=msgs></div></div>
- <div><h2>Repo admin/task</h2><div class=card id=repo></div></div>
+    claims, patched = _task_cards()
+    now = int(time.time())
+    main_files = set(repo.get("files") or [])
+    doing, done = [], []
+    for f, (a, ts, d) in claims.items():
+        if f in patched or f in main_files:
+            continue
+        doing.append({"file": f, "worker": a, "desc": d, "age": now - ts})
+    doing.sort(key=lambda x: x["age"])
+    for f, (a, ts) in patched.items():
+        if f not in main_files:
+            done.append({"file": f, "worker": a})
+    done.sort(key=lambda x: x["file"])
+
+    wmap = {}
+    for f, (a, ts, d) in claims.items():
+        if a not in wmap or ts > wmap[a]["ts"]:
+            wmap[a] = {"name": a, "file": f, "desc": d, "ts": ts}
+    workers = sorted(wmap.values(), key=lambda x: x["name"])
+    for w in workers:
+        w["age"] = now - w["ts"]
+        w["working"] = w["age"] < 150
+        w["landed"] = w["file"] in patched
+
+    sp = spec()
+    return {"spec": {"title": sp["title"], "items": sp["items"]},
+            "kanban": {"backlog": sp["items"], "doing": doing[:14], "done": done[:16],
+                       "merged": sorted(x for x in main_files)},
+            "workers": workers, "repo": repo, "messages": msgs, "ts": now}
+
+# ---------------------------------------------------------------- dashboard
+DASH = r"""<!doctype html><html lang=pt-BR><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Agensh · escritório ao vivo</title>
+<style>
+*{box-sizing:border-box}
+body{background:#0b0d12;color:#e6eaf2;font:13px/1.45 ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif;margin:0;padding:14px}
+h1{font-size:15px;margin:0;letter-spacing:.02em}
+h2{font-size:11px;margin:0 0 8px;color:#8ab4ff;text-transform:uppercase;letter-spacing:.12em;font-weight:700}
+.hdr{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+.hdr .pill{background:#151a24;border:1px solid #232a38;border-radius:999px;padding:3px 10px;font-size:11px;color:#9fb0c8}
+.hdr .spec{color:#ffd479}
+.live{width:8px;height:8px;border-radius:50%;background:#39d98a;box-shadow:0 0 0 0 rgba(57,217,138,.7);animation:pulse 2s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(57,217,138,.6)}70%{box-shadow:0 0 0 9px rgba(57,217,138,0)}100%{box-shadow:0 0 0 0 rgba(57,217,138,0)}}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}
+.panel{background:#101521;border:1px solid #1d2432;border-radius:12px;padding:12px}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.col{background:#0d1119;border:1px solid #1a2130;border-radius:9px;padding:7px;min-height:120px}
+.col h3{margin:0 0 6px;font-size:11px;color:#7f8ea8;text-transform:uppercase;letter-spacing:.08em;display:flex;justify-content:space-between}
+.col h3 b{color:#c8d4e6}
+.cards{display:flex;flex-direction:column;gap:6px}
+.card{background:#161d2b;border:1px solid #25304a;border-left:3px solid #4a5a7a;border-radius:7px;padding:6px 8px;font-size:12px;transition:transform .15s,box-shadow .15s}
+.card .f{font-family:ui-monospace,Menlo,monospace;color:#9fd0ff;font-weight:600}
+.card .w{color:#8ea2c0;font-size:10.5px;display:block;margin-top:2px}
+.card .d{color:#7c8ba6;font-size:10.5px;display:block;margin-top:3px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.card.doing{border-left-color:#ffd479}.card.done{border-left-color:#c9a8ff}.card.merged{border-left-color:#39d98a}
+.card.ghost{opacity:.55}
+.card.flash{box-shadow:0 0 0 2px rgba(138,180,255,.45)}
+.rooms{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.cubicle{background:linear-gradient(180deg,#141b28,#0f141e);border:1px solid #202839;border-radius:10px;padding:10px;position:relative;overflow:hidden}
+.cubicle .top{display:flex;align-items:center;gap:7px}
+.avatar{width:26px;height:26px;border-radius:7px;background:#1c2740;display:grid;place-items:center;font-size:14px;flex:none}
+.who{font-weight:700;font-size:12.5px}
+.led{width:9px;height:9px;border-radius:50%;background:#3a4356;margin-left:auto;flex:none}
+.led.on{background:#39d98a;animation:pulse 1.6s infinite}
+.led.off{background:#5a6478}
+.role{font-size:10px;color:#6d7c96;margin-top:1px}
+.desk{height:52px;margin-top:8px;border-bottom:2px solid #27324a;position:relative}
+.desk .walk{position:absolute;bottom:2px;font-size:18px;transition:left .9s cubic-bezier(.2,.7,.3,1)}
+.hand{margin-top:8px;min-height:44px;border:1px dashed #2a3347;border-radius:7px;padding:5px 7px;background:#0d1119}
+.hand .lbl{font-size:9.5px;color:#6d7c96;text-transform:uppercase;letter-spacing:.08em}
+.hand .card{margin-top:4px;cursor:default}
+body.tick .cubicle .walk{left:78%}
+.chat{max-height:38vh;overflow:auto;display:flex;flex-direction:column;gap:2px}
+.m{display:flex;gap:8px;padding:3px 5px;border-radius:6px;font-size:12.5px}
+.m:nth-child(odd){background:#0d1119}
+.m .u{color:#8ab4ff;font-weight:600;flex:none;min-width:74px}
+.m .t{color:#cfd8e6;word-break:break-word}
+.m .ts{color:#55617a;font-size:10px;margin-left:auto;flex:none}
+.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:10px;font-size:11px;color:#8ea2c0}
+.chip{background:#151a24;border:1px solid #232a38;border-radius:999px;padding:2px 9px}
+.chip.pr{color:#ffd479}.chip.mg{color:#39d98a}
+#fly{position:fixed;pointer-events:none;z-index:99;transition:all .85s cubic-bezier(.2,.7,.3,1)}
+.tip{color:#55617a;font-size:11px}
+</style></head><body>
+<div class=hdr>
+ <span class=live></span><h1>AGENSH · organização viva</h1>
+ <span class="pill spec" id=spec>—</span>
+ <span class=pill id=clock>—</span>
+ <span class=pill id=stats>—</span>
 </div>
+<div class=grid>
+ <section class=panel>
+  <h2>Quadro de tarefas</h2>
+  <div class=cols>
+   <div class=col><h3>Backlog <b id=c_backlog></b></h3><div class=cards id=k_backlog></div></div>
+   <div class=col><h3>Em andamento <b id=c_doing></b></h3><div class=cards id=k_doing></div></div>
+   <div class=col><h3>Entregue <b id=c_done></b></h3><div class=cards id=k_done></div></div>
+   <div class=col><h3>No main <b id=c_merged></b></h3><div class=cards id=k_merged></div></div>
+  </div>
+ </section>
+ <section class=panel>
+  <h2>Escritório · salas dos workers</h2>
+  <div class=rooms id=rooms></div>
+  <div class=bar id=bar></div>
+ </section>
+</div>
+<section class=panel style="margin-top:14px">
+ <h2>Mattermost · #pbench-task</h2>
+ <div class=chat id=chat></div>
+</section>
+<div id=fly></div>
 <script>
-async function tick(){
- try{const s=await (await fetch('/state')).json();
-  document.getElementById('ts').textContent='\\u00b7 '+new Date().toLocaleTimeString();
-  document.getElementById('board').innerHTML=(s.board||[]).map(e=>
-   `<div class=e><span class="k ${e.kind}">${e.kind}</span><b>${e.author||''}</b> ${e.content||''}`
-   +(e.detail?`<div class=t>${e.detail}</div>`:'')
-   +`<div class=t>${new Date((e.created_at||0)*1000).toLocaleTimeString()}</div></div>`).join('')||'<div class=t>(vazio)</div>';
-  const r=s.repo||{};
-  document.getElementById('repo').innerHTML=
-   `<b>branches:</b> ${(r.branches||[]).map(b=>'<code>'+b+'</code>').join(' ')||'-'}`
-   +`<div style="margin-top:8px"><b>files@main:</b> ${(r.files||[]).map(f=>'<code>'+f+'</code>').join(' ')||'-'}</div>`
-   +`<div style="margin-top:8px"><b>commits:</b><ul>${(r.commits||[]).map(c=>'<li><code>'+c.sha+'</code> '+c.msg+' <span class=t>('+c.author+')</span></li>').join('')||'<li>-</li>'}</ul></div>`
-   +`<div style="margin-top:8px"><b>PRs:</b><ul>${(r.pulls||[]).map(p=>'<li>'+p.head+' &rarr; '+p.state+' '+p.title+'</li>').join('')||'<li>-</li>'}</ul></div>`;
-  document.getElementById('msgs').innerHTML=(s.messages||[]).map(m=>`<div class=e><span class=t>${m.user||''}</span> ${m.msg||m.error||''}</div>`).join('')||'<div class=t>(sem mensagens)</div>';
- }catch(e){document.getElementById('ts').textContent='\\u00b7 erro '+e;}
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const cssEsc=s=>(window.CSS&&CSS.escape)?CSS.escape(s):String(s).replace(/"/g,'\\"');
+const prev={}; let first=true;
+
+function cardHTML(c, cls){
+  return `<div class="card ${cls}" data-file="${esc(c.file)}">
+    <span class=f>${esc(c.file)}</span>
+    ${c.desc?`<span class=d>${esc(c.desc)}</span>`:''}
+    ${c.worker?`<span class=w>${esc(c.worker)}${c.age!=null?` · ${c.age}s`:''}</span>`:''}
+  </div>`;
 }
-tick(); setInterval(tick,3000);
+function renderKanban(k){
+  const cols=[['backlog',''],['doing','doing'],['done','done'],['merged','merged']];
+  for(const [name,cls] of cols){
+    const box=document.getElementById('k_'+name);
+    let items=(k[name]||[]);
+    if(name==='merged') items=items.map(f=>({file:f}));
+    if(name==='backlog') items=items.map(f=>({file:f,desc:'do SPEC.md'}));
+    box.innerHTML=items.map(c=>cardHTML(c,cls||'ghost')).join('')||'<span class=tip>(vazio)</span>';
+    document.getElementById('c_'+name).textContent=items.length;
+  }
+}
+function renderRooms(ws){
+  const box=document.getElementById('rooms');
+  box.innerHTML=(ws||[]).map((w,i)=>`<div class=cubicle data-worker="${esc(w.name)}">
+    <div class=top><div class=avatar>${w.working?'👷':'😴'}</div>
+      <div><div class=who>${esc(w.name)}</div><div class=role>${w.working?'trabalhando':'ocioso'} · ${w.age}s</div></div>
+      <div class="led ${w.working?'on':'off'}"></div></div>
+    <div class=desk><span class=walk style="left:${w.working?'18%':'6%'}">🚶</span></div>
+    <div class=hand><div class=lbl>tarefa na mão</div>${w.file?cardHTML({file:w.file,desc:w.desc,worker:''}, w.landed?'done':'doing'):'<span class=tip>—</span>'}</div>
+  </div>`).join('')||'<span class=tip>(sem workers)</span>';
+  document.body.classList.toggle('tick',(ws||[]).some(w=>w.working));
+}
+function renderChat(m){
+  const box=document.getElementById('chat');
+  const near=box.scrollHeight-box.scrollTop-box.clientHeight<60;
+  box.innerHTML=(m||[]).map(x=>`<div class=m><span class=u>${esc(x.user||'')}</span>
+    <span class=t>${esc(x.msg||x.error||'')}</span>
+    <span class=ts>${x.ts?new Date(x.ts).toLocaleTimeString():''}</span></div>`).join('')||'<span class=tip>(sem mensagens)</span>';
+  if(near) box.scrollTop=box.scrollHeight;
+}
+function renderBar(r){
+  const pr=(r.pulls||[]).filter(p=>p.state==='open');
+  document.getElementById('bar').innerHTML=
+    `<span class=chip>branches: <b>${(r.branches||[]).join(', ')||'-'}</b></span>
+     <span class="chip pr">PRs abertos: <b>${pr.length}</b> ${pr.map(p=>esc(p.head)).join(' ')||''}</span>
+     <span class=chip>commits: ${(r.commits||[]).length}</span>
+     <span class=chip>arquivos@main: ${(r.files||[]).length}</span>`;
+}
+function fly(from, to, file){
+  const src=document.querySelector('.card[data-file="'+cssEsc(file)+'"]');
+  const el=document.getElementById('fly');
+  el.innerHTML=src?src.outerHTML:'<div class=card doing><span class=f>'+esc(file)+'</span></div>';
+  el.style.transition='none';
+  el.style.left=from.left+'px'; el.style.top=from.top+'px';
+  el.style.width=from.width+'px'; el.style.opacity='1';
+  el.getBoundingClientRect();
+  requestAnimationFrame(()=>{ el.style.transition='all .85s cubic-bezier(.2,.7,.3,1)';
+    el.style.left=to.left+'px'; el.style.top=to.top+'px'; el.style.width=to.width+'px'; el.style.opacity='.15'; });
+  setTimeout(()=>{ el.innerHTML=''; el.style.cssText='position:fixed;pointer-events:none;z-index:99'; },900);
+}
+async function tick(){
+ try{
+  const s=await (await fetch('/state')).json();
+  const moves=[];
+  for(const w of (s.workers||[])){
+    const before=prev[w.name];
+    if(before && before!==w.file){
+      const src=document.querySelector('.card[data-file="'+cssEsc(before)+'"]');
+      if(src) moves.push({worker:w.name,file:w.file,from:src.getBoundingClientRect()});
+    }
+    prev[w.name]=w.file;
+  }
+  document.getElementById('spec').textContent='tarefa: '+(s.spec&&s.spec.title||'—');
+  document.getElementById('clock').textContent=new Date().toLocaleTimeString();
+  document.getElementById('stats').textContent='board entries: '+(s.ts?'live':'—');
+  renderKanban(s.kanban||{}); renderRooms(s.workers); renderChat(s.messages); renderBar(s.repo||{});
+  for(const m of moves){
+    const dst=document.querySelector('.cubicle[data-worker="'+cssEsc(m.worker)+'"] .hand');
+    if(dst) fly(m.from,dst.getBoundingClientRect(),m.file);
+  }
+  for(const el of document.querySelectorAll('.hand .card, .card.doing')){el.classList.add('flash');}
+  setTimeout(()=>document.querySelectorAll('.flash').forEach(e=>e.classList.remove('flash')),400);
+ }catch(e){document.getElementById('clock').textContent='erro: '+e;}
+}
+tick(); setInterval(tick,2000);
 </script></body></html>"""
 
 @app.get("/", response_class=HTMLResponse)
