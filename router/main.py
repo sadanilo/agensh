@@ -27,6 +27,8 @@ MM_TOKEN = ENV.get("MATTERMOST_TOKEN", "")
 MM_CHANNEL = ENV.get("MATTERMOST_CHANNEL", "pbench-task")
 MM_TEAM = ENV.get("MATTERMOST_TEAM", "agentsh")
 BOARD = ENV.get("BOARD_URL", "http://board:8000")
+GITEA_HOST = ENV.get("GITEA_HOST", "")
+MATTERMOST_HOST = ENV.get("MATTERMOST_HOST", "")
 LLM_BASE = ENV.get("LLM_BASE_URL", "")
 LLM_KEY = ENV.get("LLM_API_KEY", "")
 LLM_MODEL = ENV.get("LLM_MODEL", "")
@@ -52,7 +54,10 @@ def board_grep(q):
     r.raise_for_status(); return r.json()
 
 def gh(method, path, **kw):
-    r = client.request(method, f"{GITEA}/api/v1{path}", auth=GITEA_AUTH, **kw)
+    h = dict(kw.pop("headers", None) or {})
+    if GITEA_HOST:
+        h["Host"] = GITEA_HOST
+    r = client.request(method, f"{GITEA}/api/v1{path}", auth=GITEA_AUTH, headers=h, **kw)
     r.raise_for_status()
     return r.json() if r.text else None
 
@@ -70,8 +75,9 @@ def gitea_write_file(repo, path, content, branch, message="update"):
               json={"branch": branch, "content": data, "message": message})
 
 def gitea_read_file(repo, path, ref="main"):
+    h = {"Host": GITEA_HOST} if GITEA_HOST else {}
     r = client.get(f"{GITEA}/api/v1/repos/{TASK_OWNER}/{repo}/contents/{path}",
-                   params={"ref": ref}, auth=GITEA_AUTH)
+                   params={"ref": ref}, auth=GITEA_AUTH, headers=h)
     if r.status_code != 200: return None
     j = r.json(); return base64.b64decode(j["content"]).decode()
 
@@ -80,18 +86,24 @@ def gitea_open_pr(repo, head, base="main", title="", body=""):
               json={"title": title or f"PR {head}", "body": body,
                     "head": head, "base": base})
 
+def mm_headers():
+    h = {"Authorization": f"Bearer {MM_TOKEN}"}
+    if MATTERMOST_HOST:
+        h["Host"] = MATTERMOST_HOST
+    return h
+
 def mm_post(channel, msg, user_id="bot"):
     # post to a channel; channel referenced by name in Mattermost API v4
     r = client.post(f"{MATTERMOST}/api/v4/channels/name/{MM_TEAM}:{channel}/posts",
-                    json={"message": msg}, headers={"Authorization": f"Bearer {MM_TOKEN}"})
+                    json={"message": msg}, headers=mm_headers())
     if r.status_code >= 400:
-        # fall back to posting to the channel by id resolved once
         log.warning("mm post failed (%s): %s", r.status_code, r.text[:200])
 
 def dm(user, msg, user_id="bot"):
-    # direct message to a worker handle (interrupts their turn in Agensh)
-    r = client.post(f"{MATTERMOST}/api/v4/channels/name/{MM_TEAM}:{channel}/{user}/posts",
-                    json={"message": msg}, headers={"Authorization": f"Bearer {MM_TOKEN}"})
+    # Agensh DMs interrupt a peer mid-turn; here surfaced as an addressed
+    # channel post (a true DM needs a direct channel created via the API first)
+    r = client.post(f"{MATTERMOST}/api/v4/channels/name/{MM_TEAM}:{MM_CHANNEL}/posts",
+                    json={"message": f"@{user} {msg}"}, headers=mm_headers())
     if r.status_code >= 400:
         log.warning("dm failed (%s): %s", r.status_code, r.text[:200])
 
@@ -244,23 +256,15 @@ async def net_probe():
             except Exception as e:
                 log.warning("probe tcp %s:%d closed (%s)", host, port, e)
     try:
-        r = client.get(f"{GITEA}/api/v1/version")
-        log.info("probe http gitea(%s) -> %s", GITEA, r.status_code)
+        r = client.get(f"{GITEA}/api/v1/version", headers=({"Host": GITEA_HOST} if GITEA_HOST else {}))
+        log.info("probe http gitea(%s host=%s) -> %s", GITEA, GITEA_HOST, r.status_code)
     except Exception as e:
         log.warning("probe http gitea(%s) failed: %s", GITEA, e)
-    for name in ["mattermost", "mattermost-gwl6ll407hczyipdqghjusgn",
-                 "gwl6ll407hczyipdqghjusgn", "mattermost-mattermost",
-                 "agentsh-mattermost", "mattermost-team"]:
-        try:
-            ip = socket.gethostbyname(name)
-            log.info("probe mm resolve %s -> %s", name, ip)
-            try:
-                r = client.get(f"http://{name}:8065/api/v4/system/ping")
-                log.info("probe mm http %s -> %s", name, r.status_code)
-            except Exception as e:
-                log.warning("probe mm http %s failed: %s", name, e)
-        except Exception as e:
-            log.warning("probe mm resolve %s failed: %s", name, e)
+    try:
+        r = client.get(f"{MATTERMOST}/api/v4/system/ping", headers=({"Host": MATTERMOST_HOST} if MATTERMOST_HOST else {}))
+        log.info("probe http mattermost(%s host=%s) -> %s", MATTERMOST, MATTERMOST_HOST, r.status_code)
+    except Exception as e:
+        log.warning("probe http mattermost(%s) failed: %s", MATTERMOST, e)
 
 
 async def main():
