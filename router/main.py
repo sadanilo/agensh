@@ -153,6 +153,7 @@ class Worker:
         self.branch = f"w{i+1}"
         self.last_activity = time.time()
         self.file_cache = {}
+        self.done_announced = False
 
     def system_prompt(self):
         return f"""You are {self.handle}, one of {N} equal agents on a shared task.
@@ -237,30 +238,47 @@ Never repeat a peer's FACT, never retry a recorded FAIL, never touch a file off 
         claims, done, _ = self.item_state()
         valid = {it["file"] for it in items if it["file"]}
 
-        lines = []
+        lines, mine, pending = [], [], []
         for it in items:
             f = it["file"] or it["desc"]
             if it["file"] and it["file"] in done:
                 st = "DONE"
+            elif it["file"] and claims.get(it["file"]) == self.handle:
+                st = "SEU - ja reivindicado, ESCREVA AGORA (acao write)"
+                mine.append(it["file"])
             elif it["file"] and it["file"] in claims:
                 st = f"EM ANDAMENTO ({claims[it['file']]})"
             else:
                 st = "PENDENTE"
+                if it["file"]:
+                    pending.append(it["file"])
             lines.append(f"- [{st}] {f} :: {it['desc']}")
 
-        pending = [f for f in valid if f not in done and f not in claims]
-        if items and valid and not pending:
-            board_write("FACT", f"{self.handle}: todos os itens do SPEC concluidos",
-                        author=self.handle)
-            mm_post(MM_CHANNEL, f"{self.handle} ve todos os itens do SPEC concluidos")
-            await asyncio.sleep(10)
+        # everything the task asked for has landed
+        if items and valid and not mine and not pending and all(f in done for f in valid):
+            log.info("%s: tarefa do SPEC completa", self.handle)
+            if not self.done_announced:
+                self.done_announced = True
+                board_write("FACT", f"{self.handle}: tarefa do SPEC completa", author=self.handle)
+                mm_post(MM_CHANNEL, f"{self.handle}: todos os itens do SPEC concluidos")
+            await asyncio.sleep(15)
             return
+
+        if mine:
+            hint = ("Voce ja reivindicou um item e ainda nao escreveu o codigo: "
+                    "responda com a acao 'write' para ele AGORA.")
+        elif pending:
+            hint = "Escolha UM item PENDENTE e reivindique-o com a acao 'claim'."
+        else:
+            hint = ("Todos os itens estao reivindicados por colegas. Aguarde: responda "
+                    "{\"action\":\"observe\",\"note\":\"aguardando colegas\",\"kind\":\"OBSERVED\"}.")
+            await asyncio.sleep(10)
 
         msgs = [{"role": "system", "content": self.system_prompt()},
                 {"role": "user", "content":
                     f"TAREFA: {sp['title']}\n{sp['desc']}\n\nITENS DA TAREFA:\n" + "\n".join(lines) +
                     "\n\nContexto recente do board:\n" + self.gather() +
-                    "\n\nEscolha UM item PENDENTE. Responda com o JSON da acao."}]
+                    "\n\n" + hint + " Responda com o JSON da acao."}]
         out = llm(msgs)
         decision = parse_decision(out)
         if not decision:
