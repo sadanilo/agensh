@@ -285,6 +285,12 @@ Never repeat a peer's FACT, never retry a recorded FAIL, never touch a file off 
         claims, done, _ = self.item_state()
         valid = {it["file"] for it in items if it["file"]}
 
+        if not items:
+            log.info("%s: nenhuma spec em %s/ - aguardando", self.handle, TASKS_DIR)
+            self.last_activity = time.time()
+            await asyncio.sleep(15)
+            return
+
         lines, mine, pending = [], [], []
         for it in items:
             f = it["file"] or it["desc"]
