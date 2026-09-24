@@ -216,8 +216,38 @@ Never repeat a peer's FACT, never retry a recorded FAIL."""
             mm_post(MM_CHANNEL, f"{self.handle} finished")
 
 # ---------------------------------------------------------------- coordinator
+async def net_probe():
+    import socket
+    for name in ["gitea", "mattermost", "board",
+                 "gitea-lfqomkl0hzquxgyneyvfce4e",
+                 "mattermost-gwl6ll407hczyipdqghjusgn",
+                 "host.docker.internal"]:
+        try:
+            log.info("probe resolve %s -> %s", name, socket.gethostbyname(name))
+        except Exception as e:
+            log.warning("probe resolve %s failed: %s", name, e)
+    try:
+        with open("/proc/net/route") as f:
+            for line in f.readlines()[1:]:
+                p = line.split()
+                if len(p) > 2 and p[1] == "00000000":
+                    gw = ".".join(str(int(p[2][i:i + 2], 16)) for i in (6, 4, 2, 0))
+                    log.info("probe default gateway %s", gw)
+                    break
+    except Exception as e:
+        log.warning("probe gw failed: %s", e)
+    for host in ["host.docker.internal", "gitea", "10.20.8.134"]:
+        for port in (80, 3000):
+            try:
+                s = socket.create_connection((host, port), timeout=3)
+                s.close(); log.info("probe tcp %s:%d OPEN", host, port)
+            except Exception as e:
+                log.warning("probe tcp %s:%d closed (%s)", host, port, e)
+
+
 async def main():
     log.info("start up: %d workers, model=%s", N, LLM_MODEL)
+    await net_probe()
     # seed the task repo (SPEC) if the repo isn't there yet -> let coordinator create later
     stop = asyncio.Event()
     tasks = [asyncio.create_task(Worker(i).run(stop)) for i in range(N)]
