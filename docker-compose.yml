@@ -1,0 +1,35 @@
+services:
+  board:
+    build: ./board
+    expose: ["8000"]
+    environment:
+      - BOARD_DB=/data/board.db
+    volumes:
+      - board-data:/data
+    restart: unless-stopped
+
+  router:
+    build: ./router
+    depends_on:
+      - board
+    environment:
+      - WORKERS=${WORKERS:-3}
+      - GITEA_URL=${GITEA_URL:-http://gitea:3000}
+      - GITEA_USER=${GITEA_USER}
+      - GITEA_PASS=${GITEA_PASS}
+      - MATTERMOST_URL=${MATTERMOST_URL:-http://mattermost:8065}
+      - MATTERMOST_TOKEN=${MATTERMOST_TOKEN}
+      - MATTERMOST_CHANNEL=${MATTERMOST_CHANNEL:-pbench-task}
+      - MATTERMOST_TEAM=${MATTERMOST_TEAM:-agentsh}
+      - BOARD_URL=${BOARD_URL:-http://board:8000}
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_MODEL=${LLM_MODEL}
+      - TASK_OWNER=${TASK_OWNER:-admin}
+      - TASK_REPO=${TASK_REPO:-task}
+      - BUDGET_SECONDS=${BUDGET_SECONDS:-1200}
+      - IDLE_SECONDS=${IDLE_SECONDS:-120}
+    restart: unless-stopped
+
+volumes:
+  board-data:
