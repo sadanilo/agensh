@@ -149,9 +149,10 @@ def _task_cards():
 
 _SPEC = {"ts": 0, "title": "", "items": []}
 def spec():
-    if time.time() - _SPEC["ts"] < 60 and _SPEC["items"]:
+    """The team task = SPEC.md in the task repo. Items are '<file> :: <what>'."""
+    if time.time() - _SPEC["ts"] < 30 and _SPEC["items"]:
         return _SPEC
-    title, items = "", []
+    title, desc, items = "", "", []
     try:
         r = _g(f"/repos/{GITEA_OWNER}/{GITEA_REPO}/contents/SPEC.md", params={"ref": "main"})
         if r.status_code == 200:
@@ -161,12 +162,70 @@ def spec():
                 if s.startswith("#") and not title:
                     title = s.lstrip("# ").strip()
                 elif s.startswith("- "):
-                    m = re.search(r"([\w_]+)\s*\(", s)
-                    items.append(m.group(1) + "()" if m else s[2:38].strip())
+                    m = re.match(r"^-\s*([\w./-]+\.\w+)\s*::\s*(.*)$", s)
+                    if m:
+                        items.append({"file": m.group(1), "desc": m.group(2).strip()})
+                    else:
+                        items.append({"file": "", "desc": s[2:80].strip()})
+                elif s and not s.startswith("#") and not items:
+                    desc = (desc + " " + s).strip()
     except Exception:
         pass
-    _SPEC.update(ts=time.time(), title=title or "task", items=items)
+    _SPEC.update(ts=time.time(), title=title or "(sem tarefa definida)", items=items, desc=desc[:400])
     return _SPEC
+
+def _gitea_put(path, content, message, branch="main"):
+    h = {"Host": GITEA_HOST} if GITEA_HOST else {}
+    sha = None
+    r = HX.get(f"{GITEA}/api/v1/repos/{GITEA_OWNER}/{GITEA_REPO}/contents/{path}",
+               params={"ref": branch}, auth=(GITEA_USER, GITEA_PASS), headers=h)
+    if r.status_code == 200:
+        sha = r.json().get("sha")
+    body = {"content": base64.b64encode(content.encode()).decode(),
+            "message": message, "branch": branch}
+    if sha:
+        body["sha"] = sha
+    return HX.put(f"{GITEA}/api/v1/repos/{GITEA_OWNER}/{GITEA_REPO}/contents/{path}",
+                  json=body, auth=(GITEA_USER, GITEA_PASS), headers=h)
+
+class TaskIn(BaseModel):
+    title: str
+    description: str = ""
+    items: list[str] = []
+    reset: bool = False
+
+@app.post("/task")
+def set_task(t: TaskIn):
+    """The task-submission door: writes SPEC.md to the workspace repo."""
+    norm = []
+    for raw in t.items:
+        s = (raw or "").strip()
+        if not s:
+            continue
+        if "::" in s:
+            f, d = s.split("::", 1)
+            f, d = f.strip(), d.strip()
+        else:
+            f, d = s, ""
+        if not re.match(r"^[\w./-]+\.\w+$", f):
+            f = re.sub(r"\W+", "_", f).strip("_") + ".py"
+        norm.append((f, d))
+    if not norm:
+        raise HTTPException(400, "informe ao menos um item, no formato 'arquivo.py :: o que implementar'")
+    md = (f"# Task: {t.title}\n\n{t.description}\n\n## Itens\n"
+          + "\n".join(f"- {f} :: {d}" for f, d in norm) + "\n")
+    r = _gitea_put("SPEC.md", md, f"task: {t.title}")
+    if r.status_code not in (200, 201):
+        raise HTTPException(502, f"gitea SPEC.md write failed {r.status_code}: {r.text[:200]}")
+    if t.reset:
+        c = conn(); c.execute("DELETE FROM entries"); c.commit(); c.close()
+    try:
+        write(EntryIn(kind="FACT", content=f"tarefa definida: {t.title}"[:100],
+                      detail=f"{len(norm)} itens", author="user"))
+    except Exception:
+        pass
+    _SPEC["ts"] = 0
+    return {"ok": True, "title": t.title, "items": len(norm)}
 
 _USERS = {"ts": 0, "map": {}}
 def usernames(ids):
@@ -224,16 +283,30 @@ def state():
     claims, patched, last_seen = _task_cards()
     now = int(time.time())
     main_files = set(repo.get("files") or [])
-    doing, done = [], []
-    for f, (a, ts, d) in claims.items():
-        if f in patched or f in main_files:
-            continue
-        doing.append({"file": f, "worker": a, "desc": d, "age": now - ts})
+    sp = spec()
+    items = sp.get("items") or []
+    spec_files = {i["file"] for i in items if i.get("file")}
+
+    backlog, doing, done, merged = [], [], [], []
+    for it in items:
+        f = it.get("file")
+        if f and f in main_files:
+            merged.append({"file": f, "desc": it.get("desc", "")})
+        elif f and f in patched:
+            done.append({"file": f, "desc": it.get("desc", ""), "worker": patched[f][0]})
+        elif f and f in claims:
+            a, ts, d = claims[f]
+            doing.append({"file": f, "desc": it.get("desc") or d, "worker": a, "age": now - ts})
+        else:
+            backlog.append({"file": f or (it.get("desc", "")[:24]), "desc": it.get("desc", "")})
     doing.sort(key=lambda x: x["age"])
-    for f, (a, ts) in patched.items():
-        if f not in main_files:
-            done.append({"file": f, "worker": a})
-    done.sort(key=lambda x: x["file"])
+
+    # work taken outside the task list — shown, not hidden
+    extra = []
+    for f, (a, ts, d) in claims.items():
+        if f not in spec_files and f not in main_files and f not in patched:
+            extra.append({"file": f, "worker": a, "age": now - ts})
+    extra.sort(key=lambda x: x["age"])
 
     wmap = {}
     for f, (a, ts, d) in claims.items():
@@ -245,10 +318,11 @@ def state():
         w["working"] = w["age"] < 120
         w["landed"] = w["file"] in patched
 
-    sp = spec()
-    return {"spec": {"title": sp["title"], "items": sp["items"]},
-            "kanban": {"backlog": sp["items"], "doing": doing[:14], "done": done[:16],
-                       "merged": sorted(x for x in main_files)},
+    return {"spec": {"title": sp["title"], "desc": sp.get("desc", ""), "items": items,
+                     "files": sorted(spec_files)},
+            "kanban": {"backlog": backlog[:16], "doing": doing[:14],
+                       "done": done[:16], "merged": merged[:16]},
+            "extra": extra[:10],
             "workers": workers, "repo": repo, "messages": msgs, "ts": now}
 
 # ---------------------------------------------------------------- dashboard
@@ -303,6 +377,14 @@ body.tick .cubicle .walk{left:78%}
 .bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:10px;font-size:11px;color:#8ea2c0}
 .chip{background:#151a24;border:1px solid #232a38;border-radius:999px;padding:2px 9px}
 .chip.pr{color:#ffd479}.chip.mg{color:#39d98a}
+.tform{display:flex;flex-direction:column;gap:7px}
+.tform input,.tform textarea{background:#0d1119;border:1px solid #25304a;border-radius:7px;color:#e6eaf2;padding:7px 9px;font:12.5px/1.4 ui-monospace,Menlo,monospace;width:100%}
+.tform textarea{resize:vertical}
+.trow{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+button{background:#1d4ed8;border:0;color:#fff;font:600 12.5px ui-sans-serif,system-ui;padding:9px 18px;border-radius:8px;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+.chip.warn{color:#ff9a9a}
+.specdesc{color:#8ea2c0;font-size:11.5px;margin:-4px 0 12px}
 #fly{position:fixed;pointer-events:none;z-index:99;transition:all .85s cubic-bezier(.2,.7,.3,1)}
 .tip{color:#55617a;font-size:11px}
 </style></head><body>
@@ -312,6 +394,7 @@ body.tick .cubicle .walk{left:78%}
  <span class=pill id=clock>—</span>
  <span class=pill id=stats>—</span>
 </div>
+<div class=specdesc id=specdesc></div>
 <div class=grid>
  <section class=panel>
   <h2>Quadro de tarefas</h2>
@@ -328,6 +411,19 @@ body.tick .cubicle .walk{left:78%}
   <div class=bar id=bar></div>
  </section>
 </div>
+<section class="panel" style="margin-top:14px">
+ <h2>Passar uma tarefa para a organiza&ccedil;&atilde;o</h2>
+ <div class=tform>
+  <input id=t_title placeholder="T&iacute;tulo da tarefa" autocomplete=off>
+  <textarea id=t_desc rows=2 placeholder="Descri&ccedil;&atilde;o / entreg&aacute;vel: o que a equipe deve produzir"></textarea>
+  <textarea id=t_items rows=5 placeholder="Um item por linha, no formato:   arquivo.py :: o que implementar"></textarea>
+  <div class=trow>
+   <button id=t_send>Enviar tarefa</button>
+   <label class=tip><input type=checkbox id=t_reset> limpar hist&oacute;rico do board</label>
+   <span id=t_status class=tip></span>
+  </div>
+ </div>
+</section>
 <section class=panel style="margin-top:14px">
  <h2>Mattermost · #pbench-task</h2>
  <div class=chat id=chat></div>
@@ -346,13 +442,11 @@ function cardHTML(c, cls){
   </div>`;
 }
 function renderKanban(k){
-  const cols=[['backlog',''],['doing','doing'],['done','done'],['merged','merged']];
+  const cols=[['backlog','ghost'],['doing','doing'],['done','done'],['merged','merged']];
   for(const [name,cls] of cols){
     const box=document.getElementById('k_'+name);
-    let items=(k[name]||[]);
-    if(name==='merged') items=items.map(f=>({file:f}));
-    if(name==='backlog') items=items.map(f=>({file:f,desc:'do SPEC.md'}));
-    box.innerHTML=items.map(c=>cardHTML(c,cls||'ghost')).join('')||'<span class=tip>(vazio)</span>';
+    const items=(k[name]||[]).map(c=>(typeof c==='string')?{file:c}:c);
+    box.innerHTML=items.map(c=>cardHTML(c,cls)).join('')||'<span class=tip>(vazio)</span>';
     document.getElementById('c_'+name).textContent=items.length;
   }
 }
@@ -375,13 +469,15 @@ function renderChat(m){
     <span class=ts>${x.ts?new Date(x.ts).toLocaleTimeString():''}</span></div>`).join('')||'<span class=tip>(sem mensagens)</span>';
   if(near) box.scrollTop=box.scrollHeight;
 }
-function renderBar(r){
+function renderBar(r, extra){
   const pr=(r.pulls||[]).filter(p=>p.state==='open');
+  const ex=(extra||[]);
   document.getElementById('bar').innerHTML=
     `<span class=chip>branches: <b>${(r.branches||[]).join(', ')||'-'}</b></span>
      <span class="chip pr">PRs abertos: <b>${pr.length}</b> ${pr.map(p=>esc(p.head)).join(' ')||''}</span>
      <span class=chip>commits: ${(r.commits||[]).length}</span>
-     <span class=chip>arquivos@main: ${(r.files||[]).length}</span>`;
+     <span class=chip>arquivos@main: ${(r.files||[]).length}</span>
+     ${ex.length?`<span class="chip warn">fora do SPEC: <b>${ex.length}</b> ${ex.map(e=>esc(e.file)).join(' ')||''}</span>`:''}`;
 }
 function fly(from, to, file){
   const src=document.querySelector('.card[data-file="'+cssEsc(file)+'"]');
@@ -408,9 +504,10 @@ async function tick(){
     prev[w.name]=w.file;
   }
   document.getElementById('spec').textContent='tarefa: '+(s.spec&&s.spec.title||'—');
+  document.getElementById('specdesc').textContent=(s.spec&&s.spec.desc)||'';
   document.getElementById('clock').textContent=new Date().toLocaleTimeString();
   document.getElementById('stats').textContent='board entries: '+(s.ts?'live':'—');
-  renderKanban(s.kanban||{}); renderRooms(s.workers); renderChat(s.messages); renderBar(s.repo||{});
+  renderKanban(s.kanban||{}); renderRooms(s.workers); renderChat(s.messages); renderBar(s.repo||{}, s.extra);
   for(const m of moves){
     const dst=document.querySelector('.cubicle[data-worker="'+cssEsc(m.worker)+'"] .hand');
     if(dst) fly(m.from,dst.getBoundingClientRect(),m.file);
@@ -419,6 +516,22 @@ async function tick(){
   setTimeout(()=>document.querySelectorAll('.flash').forEach(e=>e.classList.remove('flash')),400);
  }catch(e){document.getElementById('clock').textContent='erro: '+e;}
 }
+document.getElementById('t_send').onclick=async()=>{
+  const btn=document.getElementById('t_send'), st=document.getElementById('t_status');
+  const title=document.getElementById('t_title').value.trim();
+  const items=document.getElementById('t_items').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  if(!title||!items.length){ st.textContent='informe o t\u00edtulo e ao menos 1 item'; return; }
+  btn.disabled=true; st.textContent='enviando...';
+  try{
+    const r=await fetch('/task',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({title, description:document.getElementById('t_desc').value.trim(),
+        items, reset:document.getElementById('t_reset').checked})});
+    let j={}; try{ j=await r.json(); }catch(e){}
+    st.textContent = r.ok ? ('enviada: '+j.items+' itens. Os workers pegam em segundos.')
+                          : ('erro '+r.status+': '+((j.detail)||''));
+  }catch(e){ st.textContent='erro: '+e; }
+  btn.disabled=false;
+};
 tick(); setInterval(tick,2000);
 </script></body></html>"""
 

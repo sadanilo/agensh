@@ -155,42 +155,65 @@ class Worker:
         self.file_cache = {}
 
     def system_prompt(self):
-        return f"""You are {self.handle}, one of {N} equal agents rebuilding a small program.
+        return f"""You are {self.handle}, one of {N} equal agents on a shared task.
 Work is tracked in Gitea; you talk on Mattermost; you share findings on the board.
-Cooperation loop each step:
-1. Read the recent board entries (shared context) + recent messages.
-2. If a peer CLAIMs the file you were about to touch, pick a different one.
-3. CLAIM the next slice of work on the board.
-4. Produce a single, correct, self-contained Python file for that slice (a module
-   that is logic-correct and runs).
-5. Verify it: it must be valid Python and implement what it claims.
-6. Publish PATCH_SUMMARY in the form files= | idea= | evidence=.
+
+THE TASK IS THE SPEC FILE. It lists the work items as `<file> :: <what to implement>`.
+HARD RULES:
+1. Work ONLY on the files named in the task list. NEVER invent a new module and never
+   add a helper the task did not ask for. Inventing files is a failure, not progress.
+2. Claim exactly ONE item whose status is PENDENTE. Do not take an item another peer
+   already has EM ANDAMENTO; prefer a different pending item.
+3. Implement that one item, in the file the item names, as a single correct
+   self-contained Python module.
+4. Then PATCH_SUMMARY as files= | idea= | evidence=.
+5. When all items are DONE, reply with the "done" action.
 Respond with ONLY a JSON object. Valid actions:
-{{"action":"claim","file":"<path.py>","summary":"<what you will build>"}}
-{{"action":"write","file":"<path.py>","code":"<full python source>"}}
-{{"action":"fail","file":"<path.py>","reason":"<why>"}}
-{{"action":"observe","note":"<an observation>", "kind":"FACT|OBSERVED"}}
+{{"action":"claim","file":"<file named in the task list>","summary":"<what you will build>"}}
+{{"action":"write","file":"<file named in the task list>","code":"<full python source>"}}
+{{"action":"fail","file":"<file>","reason":"<why>"}}
+{{"action":"observe","note":"<an observation>","kind":"FACT|OBSERVED"}}
 {{"action":"done","summary":"<final state>"}}
-Never repeat a peer's FACT, never retry a recorded FAIL."""
+Never repeat a peer's FACT, never retry a recorded FAIL, never touch a file off the list."""
+
+    def spec(self):
+        """The team task = SPEC.md in the task repo; items are '<file> :: <what>'."""
+        txt = gitea_read_file(TASK_REPO, "SPEC.md", ref="main") or ""
+        title, desc, items = "", "", []
+        for line in txt.splitlines():
+            s = line.strip()
+            if s.startswith("#") and not title:
+                title = s.lstrip("# ").strip()
+            elif s.startswith("- "):
+                m = re.match(r"^-\s*([\w./-]+\.\w+)\s*::\s*(.*)$", s)
+                if m:
+                    items.append({"file": m.group(1), "desc": m.group(2).strip()})
+                else:
+                    items.append({"file": "", "desc": s[2:80].strip()})
+            elif s and not s.startswith("#") and not items:
+                desc = (desc + " " + s).strip()
+        return {"title": title or "(sem tarefa)", "desc": desc[:400], "items": items}
+
+    def item_state(self):
+        """Read the board once: which task items are claimed / already landed."""
+        recent = board_recent(500)
+        claims, done = {}, set()
+        for e in recent:
+            c = e.get("content") or ""
+            if e["kind"] == "CLAIM":
+                m = re.search(r"building\s+([\w./-]+)", c)
+                if m and m.group(1) not in claims:
+                    claims[m.group(1)] = e["author"]
+            elif e["kind"] == "PATCH_SUMMARY":
+                m = re.search(r"files=([\w./-]+)", c)
+                if m:
+                    done.add(m.group(1))
+        return claims, done, recent
 
     def gather(self):
         recent = board_recent()
-        board_txt = "\n".join(
-            f"[{e['kind']}][{e['author']}] {e['content']}" for e in recent[:60])
-        files = self.select_slices()
-        return board_txt, files
-
-    def select_slices(self):
-        # task-specific slices (synthetic task). The task repo has a spec file.
-        spec = gitea_read_file(TASK_REPO, "SPEC.md") or "implement mywc.py"
-        for ref in (self.branch, "main"):
-            try:
-                listing = gh("GET", f"/repos/{TASK_OWNER}/{TASK_REPO}/contents",
-                             params={"ref": ref})
-                return [x["name"] for x in (listing or [])]
-            except Exception:
-                continue
-        return []
+        return "\n".join(
+            f"[{e['kind']}][{e['author']}] {e['content']}" for e in recent[:50])
 
     async def run(self, stop_event):
         log.info("%s online", self.handle)
@@ -209,24 +232,58 @@ Never repeat a peer's FACT, never retry a recorded FAIL."""
         log.info("%s stopping", self.handle)
 
     async def step(self):
-        board_txt, files = self.gather()
-        msgs = [{"role":"system","content":self.system_prompt()},
-                {"role":"user","content":
-                    "Recent shared context:\n"+board_txt+
-                    "\nExisting files: "+", ".join(files or ["(none)"])+
-                    "\nWhat is your next action? Respond with only the JSON action."}]
+        sp = self.spec()
+        items = sp["items"]
+        claims, done, _ = self.item_state()
+        valid = {it["file"] for it in items if it["file"]}
+
+        lines = []
+        for it in items:
+            f = it["file"] or it["desc"]
+            if it["file"] and it["file"] in done:
+                st = "DONE"
+            elif it["file"] and it["file"] in claims:
+                st = f"EM ANDAMENTO ({claims[it['file']]})"
+            else:
+                st = "PENDENTE"
+            lines.append(f"- [{st}] {f} :: {it['desc']}")
+
+        pending = [f for f in valid if f not in done and f not in claims]
+        if items and valid and not pending:
+            board_write("FACT", f"{self.handle}: todos os itens do SPEC concluidos",
+                        author=self.handle)
+            mm_post(MM_CHANNEL, f"{self.handle} ve todos os itens do SPEC concluidos")
+            await asyncio.sleep(10)
+            return
+
+        msgs = [{"role": "system", "content": self.system_prompt()},
+                {"role": "user", "content":
+                    f"TAREFA: {sp['title']}\n{sp['desc']}\n\nITENS DA TAREFA:\n" + "\n".join(lines) +
+                    "\n\nContexto recente do board:\n" + self.gather() +
+                    "\n\nEscolha UM item PENDENTE. Responda com o JSON da acao."}]
         out = llm(msgs)
         decision = parse_decision(out)
         if not decision:
             return
         self.last_activity = time.time()
         action = decision.get("action")
+
         if action == "claim":
-            board_write("CLAIM", f"{self.handle} building {decision['file']}",
-                        decision.get("summary",""), author=self.handle)
-            mm_post(MM_CHANNEL, f"{self.handle} CLAIMs {decision['file']}: {decision.get('summary','')}")
+            f = decision.get("file", "")
+            if valid and f not in valid:
+                board_write("FAIL", f"{self.handle} recusou {f}: fora do SPEC", author=self.handle)
+                mm_post(MM_CHANNEL, f"{self.handle} recusou item fora do SPEC: {f}")
+                await asyncio.sleep(5)
+                return
+            board_write("CLAIM", f"{self.handle} building {f}",
+                        decision.get("summary", ""), author=self.handle)
+            mm_post(MM_CHANNEL, f"{self.handle} CLAIMs {f}: {decision.get('summary','')}")
         elif action == "write":
             f = decision["file"]; code = decision["code"]
+            if valid and f not in valid:
+                board_write("FAIL", f"{self.handle} recusou escrever {f}: fora do SPEC",
+                            author=self.handle)
+                return
             # light verify: valid python
             try:
                 compile(code, f, "exec")

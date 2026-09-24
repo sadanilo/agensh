@@ -28,9 +28,11 @@ services:
     environment:
       - WORKERS=${WORKERS:-3}
       - GITEA_URL=${GITEA_URL:-http://gitea:3000}
+      - GITEA_HOST=${GITEA_HOST}
       - GITEA_USER=${GITEA_USER}
       - GITEA_PASS=${GITEA_PASS}
       - MATTERMOST_URL=${MATTERMOST_URL:-http://mattermost:8065}
+      - MATTERMOST_HOST=${MATTERMOST_HOST}
       - MATTERMOST_TOKEN=${MATTERMOST_TOKEN}
       - MATTERMOST_CHANNEL=${MATTERMOST_CHANNEL:-pbench-task}
       - MATTERMOST_TEAM=${MATTERMOST_TEAM:-agentsh}
